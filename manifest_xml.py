@@ -461,6 +461,13 @@ class XmlManifest(object):
                   (remote.name))
           else:
             self._remotes[remote.name] = remote
+      if node.nodeName == 'remove-remote':
+        name = self._reqatt(node, 'name')
+
+        if name not in self._remotes:
+          raise ManifestParseError('remove-remote element specifies non-existent '
+                                   'remote: %s' % name)
+        del self._remotes[name]
 
     for node in itertools.chain(*node_list):
       if node.nodeName == 'default':
@@ -569,7 +576,6 @@ class XmlManifest(object):
         # the repo-hooks element too.
         if self._repo_hooks_project and (self._repo_hooks_project.name == name):
           self._repo_hooks_project = None
-
 
   def _AddMetaProjectMirror(self, m):
     name = None
