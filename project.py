@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from __future__ import print_function
-import contextlib
 import errno
 import filecmp
 import glob
@@ -31,7 +30,7 @@ import traceback
 
 from color import Coloring
 from git_command import GitCommand, git_require
-from git_config import GitConfig, IsId, GetSchemeFromUrl, ID_RE
+from git_config import GitConfig, IsId, GetSchemeFromUrl, GetUrlCookieFile, ID_RE
 from error import GitError, HookError, UploadError, DownloadError
 from error import ManifestInvalidRevisionError
 from error import NoManifestException
@@ -63,6 +62,10 @@ def _lwrite(path, content):
 def _error(fmt, *args):
   msg = fmt % args
   print('error: %s' % msg, file=sys.stderr)
+
+def _warn(fmt, *args):
+  msg = fmt % args
+  print('warn: %s' % msg, file=sys.stderr)
 
 def not_rev(r):
   return '^' + r
@@ -569,7 +572,8 @@ class Project(object):
                parent=None,
                is_derived=False,
                dest_branch=None,
-               optimized_fetch=False):
+               optimized_fetch=False,
+               old_revision=None):
     """Init a Project object.
 
     Args:
@@ -593,6 +597,7 @@ class Project(object):
       dest_branch: The branch to which to push changes for review by default.
       optimized_fetch: If True, when a project is set to a sha1 revision, only
                        fetch from the remote if the sha1 is not present locally.
+      old_revision: saved git commit id for open GITC projects.
     """
     self.manifest = manifest
     self.name = name
@@ -640,6 +645,7 @@ class Project(object):
     self.bare_ref = GitRefs(gitdir)
     self.bare_objdir = self._GitGetByExec(self, bare=True, gitdir=objdir)
     self.dest_branch = dest_branch
+    self.old_revision = old_revision
 
     # This will be filled in if a project is later identified to be the
     # project containing repo hooks.
@@ -1093,8 +1099,7 @@ class Project(object):
         tar.extractall(path=path)
         return True
     except (IOError, tarfile.TarError) as e:
-      print("error: Cannot extract archive %s: "
-            "%s" % (tarpath, str(e)), file=sys.stderr)
+      _error("Cannot extract archive %s: %s", tarpath, str(e))
     return False
 
   def Sync_NetworkHalf(self,
@@ -1111,8 +1116,7 @@ class Project(object):
     """
     if archive and not isinstance(self, MetaProject):
       if self.remote.url.startswith(('http://', 'https://')):
-        print("error: %s: Cannot fetch archives from http/https "
-              "remotes." % self.name, file=sys.stderr)
+        _error("%s: Cannot fetch archives from http/https remotes.", self.name)
         return False
 
       name = self.relpath.replace('\\', '/')
@@ -1123,7 +1127,7 @@ class Project(object):
       try:
         self._FetchArchive(tarpath, cwd=topdir)
       except GitError as e:
-        print('error: %s' % str(e), file=sys.stderr)
+        _error('%s', e)
         return False
 
       # From now on, we only need absolute tarpath
@@ -1134,8 +1138,7 @@ class Project(object):
       try:
         os.remove(tarpath)
       except OSError as e:
-        print("warn: Cannot remove archive %s: "
-              "%s" % (tarpath, str(e)), file=sys.stderr)
+        _warn("Cannot remove archive %s: %s", tarpath, str(e))
       self._CopyAndLinkFiles()
       return True
     if is_new is None:
@@ -1195,6 +1198,8 @@ class Project(object):
     self._InitHooks()
 
   def _CopyAndLinkFiles(self):
+    if self.manifest.isGitcClient:
+      return
     for copyfile in self.copyfiles:
       copyfile._Copy()
     for linkfile in self.linkfiles:
@@ -1270,6 +1275,8 @@ class Project(object):
         # Except if the head needs to be detached
         #
         if not syncbuf.detach_head:
+          # The copy/linkfile config may have changed.
+          self._CopyAndLinkFiles()
           return
       else:
         lost = self._revlist(not_rev(revid), HEAD)
@@ -1287,6 +1294,8 @@ class Project(object):
     if head == revid:
       # No changes; don't do anything further.
       #
+      # The copy/linkfile config may have changed.
+      self._CopyAndLinkFiles()
       return
 
     branch = self.GetBranch(branch)
@@ -1425,9 +1434,11 @@ class Project(object):
 
 ## Branch Management ##
 
-  def StartBranch(self, name):
+  def StartBranch(self, name, branch_merge=''):
     """Create a new branch off the manifest's revision.
     """
+    if not branch_merge:
+      branch_merge = self.revisionExpr
     head = self.work_git.GetHead()
     if head == (R_HEADS + name):
       return True
@@ -1441,9 +1452,9 @@ class Project(object):
 
     branch = self.GetBranch(name)
     branch.remote = self.GetRemote(self.remote.name)
-    branch.merge = self.revisionExpr
-    if not branch.merge.startswith('refs/') and not ID_RE.match(self.revisionExpr):
-      branch.merge = R_HEADS + self.revisionExpr
+    branch.merge = branch_merge
+    if not branch.merge.startswith('refs/') and not ID_RE.match(branch_merge):
+      branch.merge = R_HEADS + branch_merge
     revid = self.GetRevisionId(all_refs)
 
     if head.startswith(R_HEADS):
@@ -1451,7 +1462,6 @@ class Project(object):
         head = all_refs[head]
       except KeyError:
         head = None
-
     if revid and head and revid == head:
       ref = os.path.join(self.gitdir, R_HEADS + name)
       try:
@@ -1877,6 +1887,13 @@ class Project(object):
 
     if depth:
       cmd.append('--depth=%s' % depth)
+    else:
+      # If this repo has shallow objects, then we don't know which refs have
+      # shallow objects or not. Tell git to unshallow all fetched refs.  Don't
+      # do this with projects that don't have shallow objects, since it is less
+      # efficient.
+      if os.path.exists(os.path.join(self.gitdir, 'shallow')):
+        cmd.append('--depth=2147483647')
 
     if quiet:
       cmd.append('--quiet')
@@ -1913,16 +1930,6 @@ class Project(object):
             branch = R_HEADS + branch
           spec.append(str((u'+%s:' % branch) + remote.ToLocal(branch)))
     cmd.extend(spec)
-
-    shallowfetch = self.config.GetString('repo.shallowfetch')
-    if shallowfetch and shallowfetch != ' '.join(spec):
-      GitCommand(self, ['fetch', '--depth=2147483647', name]
-                 + shallowfetch.split(),
-                 bare=True, ssh_proxy=ssh_proxy).Wait()
-    if depth:
-      self.config.SetString('repo.shallowfetch', ' '.join(spec))
-    else:
-      self.config.SetString('repo.shallowfetch', None)
 
     ok = False
     for _i in range(2):
@@ -2033,7 +2040,7 @@ class Project(object):
         os.remove(tmpPath)
     if 'http_proxy' in os.environ and 'darwin' == sys.platform:
       cmd += ['--proxy', os.environ['http_proxy']]
-    with self._GetBundleCookieFile(srcUrl, quiet) as cookiefile:
+    with GetUrlCookieFile(srcUrl, quiet) as (cookiefile, proxy):
       if cookiefile:
         cmd += ['--cookie', cookiefile, '--cookie-jar', cookiefile]
       if srcUrl.startswith('persistent-'):
@@ -2080,40 +2087,6 @@ class Project(object):
           return False
     except OSError:
       return False
-
-  @contextlib.contextmanager
-  def _GetBundleCookieFile(self, url, quiet):
-    if url.startswith('persistent-'):
-      try:
-        p = subprocess.Popen(
-            ['git-remote-persistent-https', '-print_config', url],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE)
-        try:
-          prefix = 'http.cookiefile='
-          cookiefile = None
-          for line in p.stdout:
-            line = line.strip()
-            if line.startswith(prefix):
-              cookiefile = line[len(prefix):]
-              break
-          # Leave subprocess open, as cookie file may be transient.
-          if cookiefile:
-            yield cookiefile
-            return
-        finally:
-          p.stdin.close()
-          if p.wait():
-            err_msg = p.stderr.read()
-            if ' -print_config' in err_msg:
-              pass  # Persistent proxy doesn't support -print_config.
-            elif not quiet:
-              print(err_msg, file=sys.stderr)
-      except OSError as e:
-        if e.errno == errno.ENOENT:
-          pass  # No persistent proxy.
-        raise
-    yield GitConfig.ForUser().GetString('http.cookiefile')
 
   def _Checkout(self, rev, quiet=False):
     cmd = ['checkout']
@@ -2185,8 +2158,8 @@ class Project(object):
         try:
           self._CheckDirReference(self.objdir, self.gitdir, share_refs=False)
         except GitError as e:
-          print("Retrying clone after deleting %s" % force_sync, file=sys.stderr)
           if force_sync:
+            print("Retrying clone after deleting %s" % self.gitdir, file=sys.stderr)
             try:
               shutil.rmtree(os.path.realpath(self.gitdir))
               if self.worktree and os.path.exists(
@@ -2264,7 +2237,7 @@ class Project(object):
         if filecmp.cmp(stock_hook, dst, shallow=False):
           os.remove(dst)
         else:
-          _error("%s: Not replacing %s hook", self.relpath, name)
+          _warn("%s: Not replacing locally modified %s hook", self.relpath, name)
           continue
       try:
         os.symlink(os.path.relpath(stock_hook, os.path.dirname(dst)), dst)
@@ -2323,7 +2296,10 @@ class Project(object):
         # Fail if the links are pointing to the wrong place
         if src != dst:
           raise GitError('--force-sync not enabled; cannot overwrite a local '
-                         'work tree')
+                         'work tree. If you\'re comfortable with the '
+                         'possibility of losing the work tree\'s git metadata,'
+                         ' use `repo sync --force-sync {0}` to '
+                         'proceed.'.format(self.relpath))
 
   def _ReferenceGitDir(self, gitdir, dotgit, share_refs, copy_all):
     """Update |dotgit| to reference |gitdir|, using symlinks where possible.
