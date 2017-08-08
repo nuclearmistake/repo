@@ -323,13 +323,15 @@ class RemoteSpec(object):
                pushUrl=None,
                review=None,
                revision=None,
-               orig_name=None):
+               orig_name=None,
+               fetchUrl=None):
     self.name = name
     self.url = url
     self.pushUrl = pushUrl
     self.review = review
     self.revision = revision
     self.orig_name = orig_name
+    self.fetchUrl = fetchUrl
 
 
 class RepoHook(object):
@@ -687,7 +689,7 @@ class Project(object):
     self.gitdir = gitdir.replace('\\', '/')
     self.objdir = objdir.replace('\\', '/')
     if worktree:
-      self.worktree = os.path.normpath(worktree.replace('\\', '/'))
+      self.worktree = os.path.normpath(worktree).replace('\\', '/')
     else:
       self.worktree = None
     self.relpath = relpath
@@ -1198,7 +1200,8 @@ class Project(object):
                        no_tags=False,
                        archive=False,
                        optimized_fetch=False,
-                       prune=False):
+                       prune=False,
+                       submodules=False):
     """Perform only the network IO portion of the sync process.
        Local working directory/branch state is not affected.
     """
@@ -1275,7 +1278,8 @@ class Project(object):
     if (need_to_fetch and
         not self._RemoteFetch(initial=is_new, quiet=quiet, alt_dir=alt_dir,
                               current_branch_only=current_branch_only,
-                              no_tags=no_tags, prune=prune, depth=depth)):
+                              no_tags=no_tags, prune=prune, depth=depth,
+                              submodules=submodules)):
       return False
 
     if self.worktree:
@@ -1331,11 +1335,11 @@ class Project(object):
       raise ManifestInvalidRevisionError('revision %s in %s not found' %
                                          (self.revisionExpr, self.name))
 
-  def Sync_LocalHalf(self, syncbuf, force_sync=False):
+  def Sync_LocalHalf(self, syncbuf, force_sync=False, submodules=False):
     """Perform only the local IO portion of the sync process.
        Network access is not required.
     """
-    self._InitWorkTree(force_sync=force_sync)
+    self._InitWorkTree(force_sync=force_sync, submodules=submodules)
     all_refs = self.bare_ref.all
     self.CleanPublishedCache(all_refs)
     revid = self.GetRevisionId(all_refs)
@@ -1343,6 +1347,9 @@ class Project(object):
     def _doff():
       self._FastForward(revid)
       self._CopyAndLinkFiles()
+
+    def _dosubmodules():
+      self._SyncSubmodules(quiet=True)
 
     head = self.work_git.GetHead()
     if head.startswith(R_HEADS):
@@ -1377,6 +1384,8 @@ class Project(object):
 
       try:
         self._Checkout(revid, quiet=True)
+        if submodules:
+          self._SyncSubmodules(quiet=True)
       except GitError as e:
         syncbuf.fail(self, e)
         return
@@ -1401,6 +1410,8 @@ class Project(object):
                    branch.name)
       try:
         self._Checkout(revid, quiet=True)
+        if submodules:
+          self._SyncSubmodules(quiet=True)
       except GitError as e:
         syncbuf.fail(self, e)
         return
@@ -1426,6 +1437,8 @@ class Project(object):
         # strict subset.  We can fast-forward safely.
         #
         syncbuf.later1(self, _doff)
+        if submodules:
+          syncbuf.later1(self, _dosubmodules)
         return
 
     # Examine the local commits not in the remote.  Find the
@@ -1477,19 +1490,28 @@ class Project(object):
     branch.Save()
 
     if cnt_mine > 0 and self.rebase:
+      def _docopyandlink():
+        self._CopyAndLinkFiles()
+
       def _dorebase():
         self._Rebase(upstream='%s^1' % last_mine, onto=revid)
-        self._CopyAndLinkFiles()
       syncbuf.later2(self, _dorebase)
+      if submodules:
+        syncbuf.later2(self, _dosubmodules)
+      syncbuf.later2(self, _docopyandlink)
     elif local_changes:
       try:
         self._ResetHard(revid)
+        if submodules:
+          self._SyncSubmodules(quiet=True)
         self._CopyAndLinkFiles()
       except GitError as e:
         syncbuf.fail(self, e)
         return
     else:
       syncbuf.later1(self, _doff)
+      if submodules:
+        syncbuf.later1(self, _dosubmodules)
 
   def AddCopyFile(self, src, dest, absdest):
     # dest should already be an absolute path, but src is project relative
@@ -1892,7 +1914,8 @@ class Project(object):
                    alt_dir=None,
                    no_tags=False,
                    prune=False,
-                   depth=None):
+                   depth=None,
+                   submodules=False):
 
     is_sha1 = False
     tag_name = None
@@ -1963,15 +1986,17 @@ class Project(object):
           ids.add(ref_id)
           tmp.add(r)
 
-        tmp_packed = ''
-        old_packed = ''
+        tmp_packed_lines = []
+        old_packed_lines = []
 
         for r in sorted(all_refs):
           line = '%s %s\n' % (all_refs[r], r)
-          tmp_packed += line
+          tmp_packed_lines.append(line)
           if r not in tmp:
-            old_packed += line
+            old_packed_lines.append(line)
 
+        tmp_packed = ''.join(tmp_packed_lines)
+        old_packed = ''.join(old_packed_lines)
         _lwrite(packed_refs, tmp_packed)
       else:
         alt_dir = None
@@ -2003,6 +2028,9 @@ class Project(object):
 
     if prune:
       cmd.append('--prune')
+
+    if submodules:
+      cmd.append('--recurse-submodules=on-demand')
 
     spec = []
     if not current_branch_only:
@@ -2223,6 +2251,13 @@ class Project(object):
     cmd.append(rev)
     if GitCommand(self, cmd).Wait() != 0:
       raise GitError('%s reset --hard %s ' % (self.name, rev))
+
+  def _SyncSubmodules(self, quiet=True):
+    cmd = ['submodule', 'update', '--init', '--recursive']
+    if quiet:
+      cmd.append('-q')
+    if GitCommand(self, cmd).Wait() != 0:
+      raise GitError('%s submodule update --init --recursive %s ' % self.name)
 
   def _Rebase(self, upstream, onto=None):
     cmd = ['rebase']
@@ -2464,7 +2499,7 @@ class Project(object):
         else:
           raise
 
-  def _InitWorkTree(self, force_sync=False):
+  def _InitWorkTree(self, force_sync=False, submodules=False):
     dotgit = os.path.join(self.worktree, '.git')
     init_dotgit = not os.path.exists(dotgit)
     try:
@@ -2479,7 +2514,7 @@ class Project(object):
         if force_sync:
           try:
             shutil.rmtree(dotgit)
-            return self._InitWorkTree(force_sync=False)
+            return self._InitWorkTree(force_sync=False, submodules=submodules)
           except:
             raise e
         raise e
@@ -2493,6 +2528,8 @@ class Project(object):
         if GitCommand(self, cmd).Wait() != 0:
           raise GitError("cannot initialize work tree")
 
+        if submodules:
+          self._SyncSubmodules(quiet=True)
         self._CopyAndLinkFiles()
     except Exception:
       if init_dotgit:
@@ -2841,13 +2878,14 @@ class SyncBuffer(object):
 
     self.detach_head = detach_head
     self.clean = True
+    self.recent_clean = True
 
   def info(self, project, fmt, *args):
     self._messages.append(_InfoMessage(project, fmt % args))
 
   def fail(self, project, err=None):
     self._failures.append(_Failure(project, err))
-    self.clean = False
+    self._MarkUnclean()
 
   def later1(self, project, what):
     self._later_queue1.append(_Later(project, what))
@@ -2861,6 +2899,15 @@ class SyncBuffer(object):
     self._PrintMessages()
     return self.clean
 
+  def Recently(self):
+    recent_clean = self.recent_clean
+    self.recent_clean = True
+    return recent_clean
+
+  def _MarkUnclean(self):
+    self.clean = False
+    self.recent_clean = False
+
   def _RunLater(self):
     for q in ['_later_queue1', '_later_queue2']:
       if not self._RunQueue(q):
@@ -2869,7 +2916,7 @@ class SyncBuffer(object):
   def _RunQueue(self, queue):
     for m in getattr(self, queue):
       if not m.Run(self):
-        self.clean = False
+        self._MarkUnclean()
         return False
     setattr(self, queue, [])
     return True
@@ -2911,14 +2958,14 @@ class MetaProject(Project):
           self.revisionExpr = base
           self.revisionId = None
 
-  def MetaBranchSwitch(self):
+  def MetaBranchSwitch(self, submodules=False):
     """ Prepare MetaProject for manifest branch switch
     """
 
     # detach and delete manifest branch, allowing a new
     # branch to take over
     syncbuf = SyncBuffer(self.config, detach_head=True)
-    self.Sync_LocalHalf(syncbuf)
+    self.Sync_LocalHalf(syncbuf, submodules=submodules)
     syncbuf.Finish()
 
     return GitCommand(self,

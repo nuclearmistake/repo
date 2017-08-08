@@ -198,7 +198,8 @@ Gerrit Code Review:  http://code.google.com/p/gerrit/
       commit_list = branch.commits
 
       destination = opt.dest_branch or project.dest_branch or project.revisionExpr
-      print('Upload project %s/ to remote branch %s:' % (project.relpath, destination))
+      print('Upload project %s/ to remote branch %s%s:' %
+            (project.relpath, destination, ' (draft)' if opt.draft else ''))
       print('  branch %s (%2d commit%s, %s):' % (
                     name,
                     len(commit_list),
@@ -463,8 +464,8 @@ Gerrit Code Review:  http://code.google.com/p/gerrit/
                       self.manifest.topdir,
                       self.manifest.manifestProject.GetRemote('origin').url,
                       abort_if_user_denies=True)
-      pending_proj_names = [project.name for (project, avail) in pending]
-      pending_worktrees = [project.worktree for (project, avail) in pending]
+      pending_proj_names = [project.name for (project, available) in pending]
+      pending_worktrees = [project.worktree for (project, available) in pending]
       try:
         hook.Run(opt.allow_all_hooks, project_list=pending_proj_names,
                  worktree_list=pending_worktrees)
