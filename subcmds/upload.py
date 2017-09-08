@@ -154,6 +154,12 @@ Gerrit Code Review:  http://code.google.com/p/gerrit/
     p.add_option('-d', '--draft',
                  action='store_true', dest='draft', default=False,
                  help='If specified, upload as a draft.')
+    p.add_option('-p', '--private',
+                 action='store_true', dest='private', default=False,
+                 help='If specified, upload as a private change.')
+    p.add_option('-w', '--wip',
+                 action='store_true', dest='wip', default=False,
+                 help='If specified, upload as a work-in-progress change.')
     p.add_option('-D', '--destination', '--dest',
                  type='string', action='store', dest='dest_branch',
                  metavar='BRANCH',
@@ -175,6 +181,9 @@ Gerrit Code Review:  http://code.google.com/p/gerrit/
     #   Never run upload hooks, but upload anyway (AKA bypass hooks).
     # - no-verify=True, verify=True:
     #   Invalid
+    p.add_option('--no-cert-checks',
+                 dest='validate_certs', action='store_false', default=True,
+                 help='Disable verifying ssl certs (unsafe).')
     p.add_option('--no-verify',
                  dest='bypass_hooks', action='store_true',
                  help='Do not run the upload hook.')
@@ -378,7 +387,14 @@ Gerrit Code Review:  http://code.google.com/p/gerrit/
             branch.uploaded = False
             continue
 
-        branch.UploadForReview(people, auto_topic=opt.auto_topic, draft=opt.draft, dest_branch=destination)
+        branch.UploadForReview(people,
+                               auto_topic=opt.auto_topic,
+                               draft=opt.draft,
+                               private=opt.private,
+                               wip=opt.wip,
+                               dest_branch=destination,
+                               validate_certs=opt.validate_certs)
+
         branch.uploaded = True
       except UploadError as e:
         branch.error = e
