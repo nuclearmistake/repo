@@ -1954,8 +1954,6 @@ class Project(object):
 
       if is_sha1 or tag_name is not None:
         if self._CheckForImmutableRevision():
-          print('Skipped fetching project %s (already have persistent ref)'
-                % self.name)
           return True
       if is_sha1 and not depth:
         # When syncing a specific commit and --depth is not set:
